@@ -17,22 +17,30 @@ from sklearn.metrics import f1_score, roc_auc_score, accuracy_score, precision_s
 from focal_loss import FocalLoss
 from torch_geometric.loader import NeighborSampler
 from tqdm import tqdm
+from torch.nn.parallel import DataParallel
+import IPython
 
 class AE(nn.Module):
 
-    def __init__(self, n_enc, hidden,
-                 n_input, n_z):
+    def __init__(self, 
+        n_enc, #128
+        hidden,#1
+        n_input, #87
+        n_z):   #64
         super(AE, self).__init__()
-        self.enc_in = Linear(n_input, n_enc)
+        self.enc_in = Linear(n_input, n_enc)    # 87->128
+        # 一层隐藏层 128 -- 128
         self.hidden_enc = nn.ModuleList([Linear(n_enc, n_enc) for i in range(hidden)])
-        self.z_layer = Linear(n_enc, n_z)
+        self.z_layer = Linear(n_enc, n_z)   # 128 -- 64
 
-        self.dec_in = Linear(n_z, n_enc)
+        self.dec_in = Linear(n_z, n_enc)    # 64 -- 128
+        # 一层隐藏层 128 -- 128
         self.hidden_dec = nn.ModuleList([Linear(n_enc, n_enc) for i in range(hidden)])
+        # 128 -- 87
         self.x_bar_layer = Linear(n_enc, n_input)
 
     def forward(self, x):
-        enc_result = []
+        enc_result = [] # local var
         enc_result.append(F.relu(self.enc_in(x)))
         for layer in self.hidden_enc:
             enc_result.append(F.relu(layer(enc_result[-1])))
@@ -48,16 +56,16 @@ class AE(nn.Module):
 class CORE(nn.Module):
     def __init__(self, max_b):
         super(CORE, self).__init__()
-        self.weight = Parameter(torch.ones([max_b]))
-
+        self.weight = Parameter(torch.ones([max_b]))    # 1x11
+    
     def forward(self, x):
         return F.softmax(self.weight * x, dim=1)
 
 class TL(nn.Module):
     def __init__(self, n_clusters):
         super(TL, self).__init__()
-        self.to_label1 = Linear(n_clusters, n_clusters//2)
-        self.to_label2 = Linear(n_clusters//2, 2)
+        self.to_label1 = Linear(n_clusters, n_clusters//2)  # 8--4
+        self.to_label2 = Linear(n_clusters//2, 2)   #4-- 2
 
     def forward(self, x):
         x = F.relu(self.to_label1(x))
@@ -71,25 +79,39 @@ class TEL(nn.Module):
         self.to_edge_label2 = Linear(64, 2)
 
     def forward(self, edge_x):
-        
         x = F.relu(self.to_edge_label1(edge_x))
         x = F.softmax(self.to_edge_label2(x), dim=1)
         return x
 
 class GNN(nn.Module):
-    def __init__(self, n_input, n_i, n_clusters, n_enc, hidden, n_z, pre_ae_epoch, max_b):
+    def __init__(self, 
+                # n_input=dataset.u_x.shape[1],   #  87
+                # n_i=dataset.i_x.shape[1],       #  83
+                # n_clusters=args.n_clusters,     #  8
+                # n_enc = args.hidden_dim,        #  128
+                # hidden = args.hidden,           #  1
+                # n_z=args.n_z,                   #  64
+                # pre_ae_epoch = args.pre_ae_epoch,# 150
+                # max_b = dataset.max_b           # 11
+        n_input, #87
+        n_i, #83
+        n_clusters, #8
+        n_enc, #128
+        hidden, #1
+        n_z,    #64
+        pre_ae_epoch,   #150
+        max_b):
         super(GNN, self).__init__()
-        if(args.gnn == 'sage'):
+        if(args.gnn == 'sage'): # take this
             GNN_NET = SAGE_NET
         else:
             GNN_NET = GCN_NET
         self.core_u = CORE(max_b)
-        self.core_i = CORE(max_b)
-        self.n_input = n_input
-        self.ae = AE(n_enc, hidden,
-                 n_input, n_z)
+        self.core_i = CORE(max_b)   #11
+        self.n_input = n_input  #87
+        self.ae = AE(n_enc, hidden, n_input, n_z)   # 就只有这一个自编码器
         self.tl = TL(n_clusters = n_clusters)
-        self.tel = TEL(1 + n_clusters + n_input + n_i)
+        self.tel = TEL(1 + n_clusters + n_input + n_i)  # 179
         self.i_emb = Linear(n_i-max_b, n_input-max_b)
         self.gnn_in = GNN_NET(n_input, n_enc)
         self.hidden_gnn = nn.ModuleList([GNN_NET(n_enc, n_enc) for i in range(hidden)])
@@ -102,15 +124,16 @@ class GNN(nn.Module):
         # degree
         self.v = 1
         if(not os.path.exists(root_path + '/model/model_{}.pkl'.format(args.epoch))):
+            print('[+] not os.path.exists /model/model_100.pkl')
             pre_train(dataset, n_clusters, n_input, n_z, n_enc, hidden, pre_ae_epoch)
         self.ae.load_state_dict(torch.load(root_path+'/model/ae_pre_train.pkl', map_location='cpu'))
 
     def forward(self, x, edge_u_x, edge_u_id, edge_index, train=True):
         q = 0
-
+        ''' in model GNN --- '''
         x_bar, h, z = self.ae(edge_u_x)
         x = self.gnn_in(x, edge_index)
-        for i, layer in enumerate(self.hidden_gnn):
+        for i, layer in enumerate(self.hidden_gnn): # 1 layer
             x[edge_u_id] = x[edge_u_id] + h[i]
             x = layer(x, edge_index)
         x[edge_u_id] = x[edge_u_id] + h[-1]
@@ -132,6 +155,7 @@ def target_distribution(q):
     return (weight.t() / weight.sum(1)).t()
 
 def init_data(adjs, n_id, train=True):
+    ''' 这事干什么的函数 '''
     u_id_mask = (n_id < dataset.max_u)
     u_id = n_id[u_id_mask]
 
@@ -168,11 +192,7 @@ def init_data(adjs, n_id, train=True):
     
     return [u_x[:,:dataset.max_b],u_x[:,dataset.max_b:], i_x[:,:dataset.max_b], i_x[:,dataset.max_b:], u_id_mask, i_id_mask, edge_u_id, u_l_mask, edge_y_mask, u_l_y, edge_x[:,:dataset.max_b],edge_x[:,dataset.max_b:dataset.max_b*2], edge_x[:,dataset.max_b*2:], edge_y, loss_u_x]
 
-def train(adjs, n_id, train=True, test_init_data=None, final_epoch = False):
-    global model
-    global optimizer
-    global dataset
-    global focal_loss
+def train(adjs, n_id, model,optimizer,dataset,focal_loss, train=True, test_init_data=None, final_epoch = False):
     if(train):
         model.train()
         optimizer.zero_grad()
@@ -189,20 +209,20 @@ def train(adjs, n_id, train=True, test_init_data=None, final_epoch = False):
     x[i_id_mask] = torch.cat((model.core_i(i_x_core),model.i_emb(i_x)),dim=1)
     edge_x = torch.cat((model.core_u(edge_x_u_core), model.core_i(edge_x_i_core), edge_x_out_core),dim=1)
     edge_u_x = x[edge_u_id]
-
-    x, x_bar, q = model(x, edge_u_x, edge_u_id, adjs.edge_index)
+    # IPython.embed()
+    x_, x_bar, q = model(x, edge_u_x, edge_u_id, adjs.edge_index)    # inplace !!!
     p = 0
     if(train):
         p = target_distribution(q)
 
     pre_l = torch.zeros([len(n_id), 2]).to(device)
-    tmp_pre_l = torch.zeros([len(x), 2]).to(device)
-    loss_pre_l = model.tl(x[u_l_mask])
+    tmp_pre_l = torch.zeros([len(x_), 2]).to(device)
+    loss_pre_l = model.tl(x_[u_l_mask])
     tmp_pre_l[u_l_mask] = loss_pre_l
     pre_l[edge_u_id] = tmp_pre_l
 
-    total_x = torch.zeros([len(n_id), x.shape[1]]).to(device)
-    total_x[edge_u_id] = x
+    total_x = torch.zeros([len(n_id), x_.shape[1]]).to(device)
+    total_x[edge_u_id] = x_
     
     edge_us = adjs.edge_index[0][edge_y_mask]
     pre_e_l = model.tel(torch.cat((pre_l[:,1][edge_us].unsqueeze(-1), total_x[edge_us] ,edge_x),dim=1))
@@ -214,7 +234,8 @@ def train(adjs, n_id, train=True, test_init_data=None, final_epoch = False):
         kl_loss = F.kl_div(q.log(), p, reduction='batchmean')
 
         loss = args.ll * label_loss + args.el * edge_loss + args.al * ae_loss + args.kl * kl_loss
-        loss.backward()
+        with torch.autograd.detect_anomaly():
+            loss.backward() ### BOOM !
         optimizer.step()
     edge_y = edge_y.cpu()
     pre_e_l = pre_e_l[:,1].cpu().detach()
@@ -234,18 +255,16 @@ def train(adjs, n_id, train=True, test_init_data=None, final_epoch = False):
         torch.cuda.empty_cache()
         return auc, f1, acc, pre, recall, max_th
 
-def train_exp(dataset):
-    global model
-    global optimizer
+def train_exp(dataset,focal_loss):
     model = GNN(
-                n_input=dataset.u_x.shape[1],
-                n_i=dataset.i_x.shape[1],
-                n_clusters=args.n_clusters,
-                n_enc = args.hidden_dim, 
-                hidden = args.hidden,
-                n_z=args.n_z,
-                pre_ae_epoch = args.pre_ae_epoch,
-                max_b = dataset.max_b
+                n_input=dataset.u_x.shape[1],   #  87
+                n_i=dataset.i_x.shape[1],       #  83
+                n_clusters=args.n_clusters,     #  8
+                n_enc = args.hidden_dim,        #  128
+                hidden = args.hidden,           #  1
+                n_z=args.n_z,                   #  64
+                pre_ae_epoch = args.pre_ae_epoch,# 150
+                max_b = dataset.max_b           # 11
                 ).to(device)
     print(model)
     print(args)
@@ -277,7 +296,7 @@ def train_exp(dataset):
     for epoch in range(1, args.epoch+1):
         total_loss = total_f1 = total_auc = 0
         for batch_size, n_id, adjs in tqdm(train_loader):
-            loss, f1, auc = train(adjs, n_id)
+            loss, f1, auc = train(adjs, n_id,model,optimizer,dataset,focal_loss)
             total_loss += loss
             total_f1 += f1
             total_auc += auc
@@ -285,7 +304,7 @@ def train_exp(dataset):
         f1 = total_f1 / batch_num
         auc = total_auc / batch_num
         
-        test_auc, test_f1, test_acc, test_pre, test_recall, max_th = train(test_adjs, test_n_id, train=False, test_init_data=test_init_data, final_epoch=(epoch==args.epoch))
+        test_auc, test_f1, test_acc, test_pre, test_recall, max_th = train(test_adjs, test_n_id,model,optimizer,dataset,focal_loss, train=False, test_init_data=test_init_data, final_epoch=(epoch==args.epoch))
         print('{} loss:{:.5f} f1:{:.4f} tauc:{:.4f} tf1:{:.4f} tacc:{:.4f} tpre:{:.4f} trecall:{:.4f} th:{}'.format(epoch, loss, f1, test_auc, test_f1, test_acc, test_pre, test_recall, max_th))
 
         if(f1 > max_train_f1):
@@ -311,7 +330,7 @@ if __name__ == "__main__":
         description='train',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--n_clusters', default=32, type=int)
+    parser.add_argument('--n_clusters', default=8, type=int)
     parser.add_argument('--n_z', default=64, type=int)
     parser.add_argument('--epoch', default=100, type=int)
     parser.add_argument('--hidden_dim', default=128, type=int)
@@ -328,15 +347,21 @@ if __name__ == "__main__":
     parser.add_argument('--gnn', type=str, default='sage')
     
     args = parser.parse_args()
-    setup_seed(args.seed)
+    setup_seed(args.seed)   # 固定住初始化
     args.cuda = torch.cuda.is_available()
-    print("use cuda: {}".format(args.cuda))
-    device = torch.device("cuda" if args.cuda else "cpu")
+    # print("use cuda: {}".format(args.cuda)) # True
+    device = torch.device("cuda:1" if args.cuda else "cpu")
+    
+    # Focal Loss 是一种针对类别不平衡问题的损失函数，通过引入调节因子来减轻易分类样本的权重，
+    #                             使模型更关注困难样本，从而提升模型在少数类别上的性能。
     focal_loss = FocalLoss(2)
     dataset = get_abcore_data(device)
     root_path, _ = os.path.split(os.path.abspath(__file__)) 
 
-    if(os.path.isdir(root_path + '/model') == False):
+    if(os.path.isdir(root_path + '/model') == False):   # 存放训练的模型参数
         os.mkdir(root_path + '/model')
-
-    train_exp(dataset)
+    
+    # 正向传播时：开启自动求导的异常侦测
+    torch.autograd.set_detect_anomaly(True) # debug
+    
+    train_exp(dataset,focal_loss)
